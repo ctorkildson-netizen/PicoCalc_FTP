@@ -1329,12 +1329,9 @@ int FtpServer::dataConnect(bool out150)
     {
       // For Raspberry Pi Pico W, ensure the data server is properly initialized
 #if defined(ARDUINO_ARCH_RP2040)
-      // Stop and restart the data server to ensure it's properly initialized
-      dataServer.end();
-      delay(10);
-      dataServer.begin();
-      DEBUG_PRINTLN(F("Restarted data server for passive mode"));
-      
+      // (The data server was restarted here, but begin() with no port
+      // reopens it on the constructor's port, not the one PASV just
+      // announced, so the client's data connection was reset.)
       // Increase timeout for Pico W
       uint16_t count = 3000; // wait up to 3 seconds for Pico W
 #else
