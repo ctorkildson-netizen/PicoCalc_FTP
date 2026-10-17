@@ -111,6 +111,21 @@ This project uses the following libraries:
 
 Contributions are welcome! Feel free to open an issue or submit a pull request.
 
+## Running from the PicoCalc boot menu
+
+The `.uf2` built from `raspberypi_pico2w` can be copied to the SD card's
+`pico2-apps` folder and started from the UF2 Loader boot menu.
+
+- **Esc** returns to the menu (wait for transfers to finish first).
+- If `config_ftp.conf` is missing, the WiFi `ssid`, `password` and `tz`
+  are read from `/settime.cfg` or `/virtualt/virtualt.cfg`, and the FTP
+  login is `picocalc` / `picocalc`.
+- The clock is set from `pool.ntp.org` (or kept from an earlier program
+  that set it), so uploaded files get real dates. `tz` is a POSIX time
+  zone string, default `PST8PDT,M3.2.0,M11.1.0`.
+- The server takes one connection at a time: in FileZilla, limit
+  simultaneous connections to 1.
+
 ## Author
 
 Kiwil

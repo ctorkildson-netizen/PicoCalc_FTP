@@ -1,186 +1,267 @@
+/* PicoCalc FTP server
+ *
+ *  - Esc returns to the PicoCalc boot menu (UF2 Loader + PicoCalc Shell),
+ *    so no power cycle is needed
+ *  - settings come from /config_ftp.conf; if it's missing, the WiFi
+ *    settings (and time zone) come from /settime.cfg or
+ *    /virtualt/virtualt.cfg, and the FTP login defaults to
+ *    picocalc / picocalc
+ *  - config lines may have spaces around '=' and '#' comments; WiFi
+ *    passwords up to 79 characters
+ *  - the clock is set from NTP (or kept from an earlier program in the
+ *    RP2350's always-on timer), so uploaded files get real dates
+ */
 #include <WiFi.h>
 #include <SPI.h>
+#include <Wire.h>
+#include <time.h>
+#include <sys/time.h>
 #include <LovyanGFX.hpp>
 #include "LGFX_config.hpp"
 #include <SdFat.h>
 #include <sdios.h>
 #include <SimpleFTPServer.h>
+#include "hardware/watchdog.h"
+#include "hardware/structs/watchdog.h"
+#include "pico/aon_timer.h"
 
-#define SCK_PIN 18
-#define MOSI_PIN 19
-#define MISO_PIN 16
 #define SS_PIN 17
 #define SD_DET_PIN 22
 
-#define FILE_NAME "config_ftp.conf"
-#define KEY_MAX_LENGTH 32
-#define VALUE_MAX_LENGTH 32
-#define CONFIG_MAX_LINES 20
+/* keyboard (the STM32 "south bridge") on I2C1 */
+#define SB_SDA  6
+#define SB_SCL  7
+#define SB_ADDR 0x1F
+#define SB_REG_FIF 0x09
+#define KEY_ESC 0xB1
 
 static LGFX lcd;
 FtpServer ftpSrv;
 SdFat sd;
 
-// ===== Buffers et Config =====
-char global_SD_buffer[KEY_MAX_LENGTH + VALUE_MAX_LENGTH + 2]; // +2 pour '=' et '\0'
-char ssid[VALUE_MAX_LENGTH] = {0};
-char password[VALUE_MAX_LENGTH] = {0};
-char ftp_user[VALUE_MAX_LENGTH] = {0};
-char ftp_password[VALUE_MAX_LENGTH] = {0};
+static char ssid[64], password[80], ftp_user[32] = "picocalc", ftp_password[32] = "picocalc";
+static char tz[64] = "PST8PDT,M3.2.0,M11.1.0";
+static const char *cfg_used = 0;
 
-struct ConfigEntry {
-  char key[KEY_MAX_LENGTH];
-  char value[VALUE_MAX_LENGTH];
-};
+/* ------------------------------------------------------------ settings */
 
-ConfigEntry configEntries[CONFIG_MAX_LINES];
-int configEntryCount = 0;
-
-// ===== Fonctions utilitaires =====
-void drawGradation(void) {
-  lcd.startWrite();
-  lcd.setAddrWindow(0, 0, lcd.width(), lcd.height());
-  for (int y = 0; y < lcd.height(); ++y) {
-    for (int x = 0; x < lcd.width(); ++x) {
-      lcd.writeColor(lcd.color888(x >> 1, (x + y) >> 2, y >> 1), 1);
-    }
-  }
-  lcd.endWrite();
+static char *trim(char *s)
+{
+  while (*s == ' ' || *s == '\t') s++;
+  char *e = s + strlen(s);
+  while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
+  return s;
 }
 
-void loadConfigFromSD() {
-  FsFile configFile = sd.open(FILE_NAME, FILE_READ);
-  if (!configFile) {
-    Serial.println("Erreur ouverture config");
-    return;
+static void set(char *dst, size_t n, const char *v) { strncpy(dst, v, n - 1); dst[n - 1] = 0; }
+
+/* read key=value lines; returns true if the file was there */
+static bool read_cfg(const char *path, bool ftp_keys)
+{
+  FsFile f = sd.open(path, O_RDONLY);
+  if (!f) return false;
+  char line[160];
+  while (f.available())
+  {
+    int len = f.readBytesUntil('\n', line, sizeof line - 1);
+    line[len] = 0;
+    char *l = trim(line);
+    if (!*l || *l == '#') continue;
+    char *eq = strchr(l, '=');
+    if (!eq) continue;
+    *eq = 0;
+    char *k = trim(l), *v = trim(eq + 1);
+    if (!strcasecmp(k, "ssid"))          set(ssid, sizeof ssid, v);
+    else if (!strcasecmp(k, "password")) set(password, sizeof password, v);
+    else if (!strcasecmp(k, "tz"))       set(tz, sizeof tz, v);
+    else if (ftp_keys && !strcasecmp(k, "ftp_user"))     set(ftp_user, sizeof ftp_user, v);
+    else if (ftp_keys && !strcasecmp(k, "ftp_password")) set(ftp_password, sizeof ftp_password, v);
   }
-
-  configEntryCount = 0;
-
-  while (configFile.available() && configEntryCount < CONFIG_MAX_LINES) {
-    int len = configFile.readBytesUntil('\n', global_SD_buffer, sizeof(global_SD_buffer) - 1);
-    if (len > 0) {
-      global_SD_buffer[len] = '\0';
-
-      if (global_SD_buffer[len - 1] == '\r') {
-        global_SD_buffer[len - 1] = '\0';
-      }
-
-      char* equalSign = strchr(global_SD_buffer, '=');
-      if (equalSign) {
-        int keyLen = equalSign - global_SD_buffer;
-        int valLen = strlen(equalSign + 1);
-
-        if (keyLen < KEY_MAX_LENGTH && valLen < VALUE_MAX_LENGTH) {
-          strncpy(configEntries[configEntryCount].key, global_SD_buffer, keyLen);
-          configEntries[configEntryCount].key[keyLen] = '\0';
-
-          strncpy(configEntries[configEntryCount].value, equalSign + 1, valLen);
-          configEntries[configEntryCount].value[valLen] = '\0';
-
-          configEntryCount++;
-        }
-      }
-    }
-  }
-
-  configFile.close();
+  f.close();
+  return true;
 }
 
-const char* getConfigValue(const char* key) {
-  for (int i = 0; i < configEntryCount; i++) {
-    if (strcmp(configEntries[i].key, key) == 0) {
-      return configEntries[i].value;
-    }
+static void load_settings()
+{
+  if (read_cfg("/config_ftp.conf", true))
+  {
+    cfg_used = "config_ftp.conf";
+    if (ssid[0]) return;
   }
-  return nullptr;
+  if (read_cfg("/settime.cfg", false) && ssid[0])
+    cfg_used = cfg_used ? "config_ftp.conf + settime.cfg" : "settime.cfg";
+  else if (read_cfg("/virtualt/virtualt.cfg", false) && ssid[0])
+    cfg_used = cfg_used ? "config_ftp.conf + virtualt.cfg" : "virtualt/virtualt.cfg";
 }
 
-// ===== Setup principal =====
-void setup() {
-  Serial.begin(115200);
+/* ------------------------------------------------------------ keyboard */
+
+static bool esc_pressed()
+{
+  Wire1.beginTransmission(SB_ADDR);
+  Wire1.write(SB_REG_FIF);
+  if (Wire1.endTransmission() != 0) return false;
+  if (Wire1.requestFrom(SB_ADDR, 2) != 2) return false;
+  uint8_t state = Wire1.read(), key = Wire1.read();
+  return state == 1 && key == KEY_ESC;      /* 1 = pressed */
+}
+
+/* back to the PicoCalc Shell: the same request picocalc_shell.h makes
+   (UF2 Loader 2.3+, stage3 loads /BOOT2350.UF2) */
+static void return_to_menu()
+{
+  lcd.println("\nBack to the menu...");
+  sd.end();
+  delay(200);
+  pinMode(SD_DET_PIN, INPUT_PULLUP);
+  delayMicroseconds(100);
+  if (digitalRead(SD_DET_PIN))              /* no card: the loader couldn't start the shell */
+  {
+    lcd.println("No SD card -- switch off instead.");
+    for (;;) delay(1000);
+  }
+  watchdog_hw->scratch[1] = 1;              /* boot from the card */
+  watchdog_hw->scratch[2] = 0;
+  watchdog_hw->scratch[0] = 0xe98cc638u;
+  watchdog_reboot(0, 0, 0);
+  for (;;) ;
+}
+
+static void wait_or_menu(const char *why)
+{
+  lcd.println(why);
+  lcd.println("Press Esc for the menu.");
+  for (;;) { if (esc_pressed()) return_to_menu(); delay(50); }
+}
+
+/* ------------------------------------------------------------ clock */
+
+/* FAT file dates, in local time */
+static void fat_datetime(uint16_t *date, uint16_t *time_)
+{
+  time_t now = time(NULL);
+  struct tm t;
+  localtime_r(&now, &t);
+  *date = FS_DATE(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+  *time_ = FS_TIME(t.tm_hour, t.tm_min, t.tm_sec);
+}
+
+static bool clock_is_set() { return time(NULL) > 1600000000; }
+
+static void set_clock()
+{
+  setenv("TZ", tz, 1);
+  tzset();
+
+  /* the always-on timer keeps the time from an earlier program
+     (settime, VirtualT) until the power goes off */
+  struct timespec ts;
+  if (aon_timer_is_running() && aon_timer_get_time(&ts) && ts.tv_sec > 1600000000)
+  {
+    struct timeval tv = { ts.tv_sec, (suseconds_t)(ts.tv_nsec / 1000) };
+    settimeofday(&tv, NULL);
+  }
+  else
+  {
+    lcd.print("Clock: asking pool.ntp.org...");
+    NTP.begin("pool.ntp.org");
+    uint32_t until = millis() + 10000;
+    while (!clock_is_set() && millis() < until) delay(100);
+    if (clock_is_set())
+    {
+      struct timeval tv;
+      gettimeofday(&tv, NULL);
+      struct timespec t2 = { tv.tv_sec, tv.tv_usec * 1000 };
+      if (aon_timer_is_running()) aon_timer_set_time(&t2); else aon_timer_start(&t2);
+    }
+    lcd.println(clock_is_set() ? " ok" : " no answer");
+  }
+  if (clock_is_set())
+  {
+    FsDateTime::setCallback(fat_datetime);
+    time_t now = time(NULL);
+    char buf[40];
+    strftime(buf, sizeof buf, "%Y-%m-%d %H:%M", localtime(&now));
+    lcd.print("Time: ");
+    lcd.println(buf);
+  }
+  else
+    lcd.println("Files will be undated.");
+}
+
+/* ------------------------------------------------------------ main */
+
+void setup()
+{
+  Wire1.setSDA(SB_SDA);
+  Wire1.setSCL(SB_SCL);
+  Wire1.begin();
+  Wire1.setClock(10000);
+  while (esc_pressed()) ;                   /* drain keys left from the menu */
 
   lcd.init();
   lcd.setRotation(4);
-  drawGradation();
+  lcd.fillScreen(TFT_BLACK);
   lcd.setTextScroll(true);
   lcd.setScrollRect(0, 0, lcd.width(), lcd.height());
+  lcd.setTextColor(TFT_GREEN);
+  lcd.println("PicoCalc FTP server   (Esc: menu)");
   lcd.setTextColor(TFT_WHITE);
-  lcd.println("FTP simple server");
 
-  if (!sd.begin(SS_PIN, SD_SCK_MHZ(20))) {
-    sd.initErrorHalt(&Serial);
-    lcd.println("SD error");
-    delay(1000);
-  }
+  if (!sd.begin(SS_PIN, SD_SCK_MHZ(20)))
+    wait_or_menu("SD card error.");
 
-  // Chargement de la config
-  loadConfigFromSD();
+  load_settings();
+  if (!ssid[0])
+    wait_or_menu("No WiFi settings: put ssid= and password=\n"
+                 "in /config_ftp.conf (or settime.cfg).");
+  lcd.print("Settings: ");
+  lcd.println(cfg_used);
 
-  const char* ssid_val = getConfigValue("ssid");
-  const char* pass_val = getConfigValue("password");
-  const char* ftp_user_val = getConfigValue("ftp_user");
-  const char* ftp_pass_val = getConfigValue("ftp_password");
-
-  if (!ssid_val || !pass_val || !ftp_user_val || !ftp_pass_val) {
-    lcd.println("Missing config");
-    Serial.println("Missing config");
-    while (true);
-  }
-
-  strcpy(ssid, ssid_val);
-  strcpy(password, pass_val);
-  strcpy(ftp_user, ftp_user_val);
-  strcpy(ftp_password, ftp_pass_val);
-
-  // Connexion WiFi
-  lcd.print("Start Wifi with ");
+  lcd.print("WiFi: joining ");
   lcd.println(ssid);
   WiFi.begin(ssid, password);
-
-  int retry_wifi = 0;
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    for (int i = 0; i < 10; i++) { if (esc_pressed()) return_to_menu(); delay(50); }
     lcd.print(".");
-    Serial.print(".");
-    if (retry_wifi++ >= 20) {
-      lcd.println("Reconnect...");
+    if (++tries % 20 == 0)
+    {
+      lcd.println(" retrying");
       WiFi.begin(ssid, password);
-      retry_wifi = 0;
     }
   }
+  lcd.println();
 
-  lcd.println("Connected");
-  lcd.print("IP: ");
-  lcd.println(WiFi.localIP());
+  set_clock();
 
-  Serial.println("");
-  Serial.print("Connected to ");
-  Serial.println(ssid);
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  lcd.println("Start FTP");
-  lcd.print("User: ");
-  lcd.print(ftp_user);
-  lcd.print(", Pass: ");
-  lcd.println(ftp_password);
-
-  // Use custom ports for better compatibility
-  // Command port: 21, Passive data port: 21000 (a port that's likely to be available)
   ftpSrv = FtpServer(21, 21000);
   ftpSrv.begin(ftp_user, ftp_password);
-  
-  // Print debug info
-  Serial.println("FTP server started");
-  Serial.print("Command port: 21, Passive port: 21000");
-  Serial.print("Local IP: ");
-  Serial.println(WiFi.localIP());
-  
-  // Force active mode for better compatibility
-  Serial.println("NOTE: If passive mode doesn't work, please use active mode in your FTP client");
+
+  lcd.println();
+  lcd.setTextColor(TFT_YELLOW);
+  lcd.print("ftp://");
+  lcd.println(WiFi.localIP());
+  lcd.setTextColor(TFT_WHITE);
+  lcd.print("User: ");
+  lcd.print(ftp_user);
+  lcd.print("   Password: ");
+  lcd.println(ftp_password);
+  lcd.println("One connection at a time (set your");
+  lcd.println("client's connection limit to 1).");
+  lcd.println();
+  lcd.println("Esc: back to the menu (wait for");
+  lcd.println("transfers to finish first).");
 }
 
-void loop() {
+void loop()
+{
   ftpSrv.handleFTP();
+  static uint32_t next;
+  if ((int32_t)(millis() - next) >= 0)
+  {
+    next = millis() + 50;
+    if (esc_pressed()) return_to_menu();
+  }
 }
