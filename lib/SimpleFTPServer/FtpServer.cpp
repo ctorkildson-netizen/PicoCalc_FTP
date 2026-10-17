@@ -1,3 +1,4 @@
+#include <time.h>
 /*
  * FtpServer Arduino, esp8266 and esp32 library for Ftp Server
  * Derived form Jean-Michel Gallego version
@@ -48,6 +49,9 @@
  */
 
 #include <FtpServer.h>
+
+static void utc_to_local(uint16_t *year, uint8_t *month, uint8_t *day,
+                         uint8_t *hour, uint8_t *minute, uint8_t *second);
 
 FtpServer::FtpServer(uint16_t _cmdPort, uint16_t _pasvPort)
     : ftpServer(_cmdPort), dataServer(_pasvPort)
@@ -1234,6 +1238,7 @@ bool FtpServer::processCommand()
       {
         if (setTime) // set file modification time
         {
+          utc_to_local(&year, &month, &day, &hour, &minute, &second);
           if (timeStamp(path, year, month, day, hour, minute, second))
           {
             client.print(F("213 "));
@@ -2647,12 +2652,44 @@ uint8_t FtpServer::getDateTime(char *dt, uint16_t *pyear, uint8_t *pmonth, uint8
 // return:
 //    pointer to tstr
 
+/* PicoCalc: FAT stores local time, but MLSD/MLST/MDTM times are UTC
+   (RFC 3659), so convert -- otherwise clients show them shifted by the
+   time zone offset. */
 char *FtpServer::makeDateTimeStr(char *tstr, uint16_t date, uint16_t time)
 {
+  struct tm t = {};
+  t.tm_year = ((date & 0xFE00) >> 9) + 80;
+  t.tm_mon = ((date & 0x01E0) >> 5) - 1;
+  t.tm_mday = date & 0x001F;
+  t.tm_hour = (time & 0xF800) >> 11;
+  t.tm_min = (time & 0x07E0) >> 5;
+  t.tm_sec = (time & 0x001F) << 1;
+  t.tm_isdst = -1;
+  time_t u = mktime(&t);
+  struct tm g;
+  if (u != (time_t)-1 && gmtime_r(&u, &g))
+    t = g;
   sprintf(tstr, "%04u%02u%02u%02u%02u%02u",
-          ((date & 0xFE00) >> 9) + 1980, (date & 0x01E0) >> 5, date & 0x001F,
-          (time & 0xF800) >> 11, (time & 0x07E0) >> 5, (time & 0x001F) << 1);
+          t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
   return tstr;
+}
+
+/* and the other way, for MFMT / MDTM-with-time (the client sends UTC) */
+static void utc_to_local(uint16_t *year, uint8_t *month, uint8_t *day,
+                         uint8_t *hour, uint8_t *minute, uint8_t *second)
+{
+  /* days since 1970-01-01 for a civil date (H. Hinnant's algorithm) */
+  int y = *year - (*month <= 2);
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (*month + (*month > 2 ? -3 : 9)) + 2) / 5 + *day - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  long days = (long)era * 146097 + (long)doe - 719468;
+  time_t u = (time_t)days * 86400 + *hour * 3600 + *minute * 60 + *second;
+  struct tm l;
+  localtime_r(&u, &l);
+  *year = l.tm_year + 1900; *month = l.tm_mon + 1; *day = l.tm_mday;
+  *hour = l.tm_hour; *minute = l.tm_min; *second = l.tm_sec;
 }
 
 uint32_t FtpServer::fileSize(FTP_FILE &file)
