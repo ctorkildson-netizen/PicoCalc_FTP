@@ -1349,7 +1349,7 @@ int FtpServer::dataConnect(bool out150)
       // reopens it on the constructor's port, not the one PASV just
       // announced, so the client's data connection was reset.)
       // Increase timeout for Pico W
-      uint16_t count = 3000; // wait up to 3 seconds for Pico W
+      uint16_t count = 10000; // wait up to 10 seconds: the WiFi can be slow to answer
 #else
       uint16_t count = 1000; // wait up to a second for other platforms
 #endif

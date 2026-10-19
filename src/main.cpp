@@ -255,6 +255,7 @@ void setup()
     }
   }
   lcd.println();
+  WiFi.noLowPowerMode();                    /* power saving delays packets enough to time out transfers */
 
   set_clock();
 
