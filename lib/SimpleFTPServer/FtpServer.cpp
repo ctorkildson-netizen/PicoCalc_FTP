@@ -996,6 +996,7 @@ bool FtpServer::processCommand()
       {
         client.print(F("451 Can't open/create "));
         client.println(parameter);
+        logLine("  451: can't create", storeTmp[0] ? storeTmp : path);
       }
       else if (!dataConnect()) // && !data.available())
       {
@@ -1400,6 +1401,7 @@ int FtpServer::dataConnect(bool out150)
   {
     DEBUG_PRINTLN(F("425 No data connection - connection failed"));
     client.println(F("425 No data connection"));
+    logLine("  425: the client's data connection never arrived");
   }
   else if (out150)
   {
@@ -1619,6 +1621,7 @@ bool FtpServer::doStore()
   if (nb < 0 || rc == nb)
     return true;
   client.println(F("552 Probably insufficient storage space"));
+  logLine("  552: writing to the card failed");
   file.close();
   discardStore();
   data.stop();
@@ -2248,6 +2251,7 @@ void FtpServer::abortTransfer()
 #endif
     client.println(F("426 Transfer aborted"));
     DEBUG_PRINTLN(F(" Transfer aborted!"));
+    logLine("  426: transfer aborted");
 
     transferStage = FTP_Close;
   }
