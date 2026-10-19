@@ -217,6 +217,7 @@ void FtpServer::iniVariables()
 
   rnfrCmd = false;
   transferStage = FTP_Close;
+  storeTmp[0] = 0;
 
   restartPos = 0;
 }
@@ -428,6 +429,7 @@ bool FtpServer::processCommand()
   // RoSchmi added the next two lines
   DEBUG_PRINT("Command is: ");
   DEBUG_PRINTLN(command);
+  logLine(command, CommandIs("PASS") ? " ****" : (parameter && *parameter) ? parameter : "");
 
   //
   //  USER - User Identity
@@ -952,35 +954,41 @@ bool FtpServer::processCommand()
     if (haveParameter() && makePath(path))
     {
       bool open;
-      
+
       // Close any open file first
       if (file)
       {
         DEBUG_PRINTLN(F("Closing any open file"));
         file.close();
       }
-      
-      // For existing files, we'll forcefully remove them first
-      if (exists(path))
+      storeTmp[0] = 0;
+
+      if (CommandIs("APPE"))
       {
-        DEBUG_PRINTLN(F("File exists - removing it completely"));
-        
-        // Try to remove the file
-        if (remove(path))
-        {
-          DEBUG_PRINTLN(F("File removed successfully"));
-          // Add a longer delay to ensure file system operations complete
-          delay(50);
-        }
-        else
-        {
-          DEBUG_PRINTLN(F("Failed to remove existing file - will try to overwrite"));
-        }
+        // append in place; create the file if it isn't there
+        open = openFile(path, FTP_FILE_WRITE_APPEND);
+        if (!open)
+          open = openFile(path, FTP_FILE_WRITE_CREATE);
       }
-      
-      // Now create a new file
-      DEBUG_PRINTLN(F("Creating new file"));
-      open = openFile(path, FTP_FILE_WRITE_CREATE);
+      else if (strlen(path) + 5 < FTP_CWD_SIZE)
+      {
+        // receive into "name.~up"; the old file stays until it's complete
+        strcpy(storeFinal, path);
+        strcpy(storeTmp, path);
+        strcat(storeTmp, ".~up");
+        if (exists(storeTmp))
+          remove(storeTmp);
+        open = openFile(storeTmp, FTP_FILE_WRITE_CREATE);
+        if (!open)
+          storeTmp[0] = 0;
+      }
+      else
+      {
+        // no room for the temporary name: overwrite as before
+        if (exists(path))
+          remove(path);
+        open = openFile(path, FTP_FILE_WRITE_CREATE);
+      }
 
       DEBUG_PRINT(F("open/create "));
       DEBUG_PRINTLN(open);
@@ -990,7 +998,10 @@ bool FtpServer::processCommand()
         client.println(parameter);
       }
       else if (!dataConnect()) // && !data.available())
+      {
         file.close();
+        discardStore();
+      }
       else
       {
         DEBUG_PRINT(F(" Receiving "));
@@ -1578,18 +1589,9 @@ bool FtpServer::doStore()
     data.stop();
 #endif
     if (data.connected())
-    {
-      // Flush the file to ensure all data is written
-      file.flush();
-      return true;
-    }
-    else
-    {
-      // Make sure to flush before closing
-      file.flush();
-      closeTransfer();
-      return false;
-    }
+      return true;              // more to come
+    closeTransfer();            // the client closed the data connection: done
+    return false;
   }
 
   if (na > FTP_BUF_SIZE)
@@ -1604,8 +1606,6 @@ bool FtpServer::doStore()
     DEBUG_PRINTLN(nb);
 
     rc = file.write(buf, nb);
-    // Flush after each write to ensure data is written to disk
-    file.flush();
     
     DEBUG_PRINT("RC -> ");
     DEBUG_PRINTLN(rc);
@@ -1617,14 +1617,10 @@ bool FtpServer::doStore()
     }
   }
   if (nb < 0 || rc == nb)
-  {
-    // Flush to ensure all data is written
-    file.flush();
     return true;
-  }
   client.println(F("552 Probably insufficient storage space"));
-  file.flush();
   file.close();
+  discardStore();
   data.stop();
   return false;
 }
@@ -2202,6 +2198,13 @@ bool FtpServer::doMlsd()
 void FtpServer::closeTransfer()
 {
   uint32_t deltaT = (int32_t)(millis() - millisBeginTrans);
+  file.close();
+  if (storeTmp[0] && !finishStore())
+  {
+    client.println(F("451 Received, but couldn't replace the old file"));
+    data.stop();
+    return;
+  }
   if (deltaT > 0 && bytesTransfered > 0)
   {
     DEBUG_PRINT(F(" Transfer completed in "));
@@ -2239,6 +2242,7 @@ void FtpServer::abortTransfer()
     }
 
     file.close();
+    discardStore();
 #if STORAGE_TYPE != STORAGE_SPIFFS && STORAGE_TYPE != STORAGE_LITTLEFS && STORAGE_TYPE != STORAGE_SEEED_SD
     dir.close();
 #endif
@@ -3007,3 +3011,38 @@ bool FtpServer::rename(const char *path, const char *newpath)
   return remove(path);
 };
 #endif
+
+
+/* ---- PicoCalc additions: safe uploads and a command log ---- */
+
+void FtpServer::logLine(const char *a, const char *b)
+{
+  if (!_logCallback)
+    return;
+  char l[96];
+  snprintf(l, sizeof l, "%s%s%s", a, *b && *b != ' ' ? " " : "", b);
+  _logCallback(l);
+}
+
+// the upload completed: put the new file in place of the old one
+bool FtpServer::finishStore()
+{
+  bool ok = true;
+  if (exists(storeFinal) && !remove(storeFinal))
+    ok = false;
+  else if (!rename(storeTmp, storeFinal))
+    ok = false;
+  logLine(ok ? "  saved" : "  ERROR: new file left as", ok ? storeFinal : storeTmp);
+  storeTmp[0] = 0;
+  return ok;
+}
+
+// the upload failed: drop the partial file, keep the old one
+void FtpServer::discardStore()
+{
+  if (!storeTmp[0])
+    return;
+  remove(storeTmp);
+  logLine("  upload failed; kept", storeFinal);
+  storeTmp[0] = 0;
+}

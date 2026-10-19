@@ -10,6 +10,10 @@
  *    passwords up to 79 characters
  *  - the clock is set from NTP (or kept from an earlier program in the
  *    RP2350's always-on timer), so uploaded files get real dates
+ *  - uploads go to "name.~up" and replace the old file only once they
+ *    have fully arrived; a failed upload leaves the old file as it was
+ *  - every command the client sends is shown on screen, with the result
+ *    of each upload
  */
 #include <WiFi.h>
 #include <SPI.h>
@@ -189,6 +193,24 @@ static void set_clock()
     lcd.println("Files will be undated.");
 }
 
+/* ------------------------------------------------------------ log */
+
+static void ftp_log(const char *line)
+{
+  char t[12] = "";
+  if (clock_is_set())
+  {
+    time_t now = time(NULL);
+    strftime(t, sizeof t, "%H:%M:%S ", localtime(&now));
+  }
+  bool result = line[0] == ' ';
+  bool bad = strstr(line, "failed") || strstr(line, "ERROR");
+  lcd.setTextColor(bad ? TFT_RED : result ? TFT_GREEN : TFT_LIGHTGREY);
+  lcd.print(t);
+  lcd.println(line);
+  lcd.setTextColor(TFT_WHITE);
+}
+
 /* ------------------------------------------------------------ main */
 
 void setup()
@@ -237,6 +259,7 @@ void setup()
   set_clock();
 
   ftpSrv = FtpServer(21, 21000);
+  ftpSrv.setLogCallback(ftp_log);
   ftpSrv.begin(ftp_user, ftp_password);
 
   lcd.println();
@@ -253,6 +276,8 @@ void setup()
   lcd.println();
   lcd.println("Esc: back to the menu (wait for");
   lcd.println("transfers to finish first).");
+  lcd.println();
+  lcd.println("Commands from your client appear below.");
 }
 
 void loop()
