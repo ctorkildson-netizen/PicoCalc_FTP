@@ -28,6 +28,11 @@
 #include "hardware/watchdog.h"
 #include "hardware/structs/watchdog.h"
 #include "pico/aon_timer.h"
+#include <lwip_wrap.h>
+#include "pico/mutex.h"
+#include "hardware/watchdog.h"
+#include "lwip/tcp.h"
+#include "lwip/priv/tcp_priv.h"
 
 #define SS_PIN 17
 #define SD_DET_PIN 22
@@ -46,6 +51,83 @@ SdFat sd;
 static char ssid[64], password[80], ftp_user[32] = "picocalc", ftp_password[32] = "picocalc";
 static char tz[64] = "PST8PDT,M3.2.0,M11.1.0";
 static const char *cfg_used = 0;
+
+/* ------------------------------------------------------------ screen */
+
+/* The log is kept here and redrawn, never scrolled on the display itself:
+   LovyanGFX's text scrolling reads the screen back over SPI (at 25 MHz,
+   which the PicoCalc's display can't do reliably -- garbled lines), and its
+   read loop has no timeout, so a lost byte froze the whole server.  This
+   only ever writes to the display. */
+#define FRZ_MAGIC 0x465A0000u                /* "FZ": a freeze note in watchdog scratch 7 */
+static volatile int in_screen;             /* core 0 is drawing (for the freeze note) */
+static volatile char core1_at = '-';       /* what core 1 is doing */
+
+class Console : public Print
+{
+public:
+  static const int COLS = 53, ROWS = 40;
+  void begin()
+  {
+    mutex_init(&mx);
+    cols = lcd.width() / 6;  if (cols > COLS) cols = COLS;
+    rows = lcd.height() / 8; if (rows > ROWS) rows = ROWS;
+    memset(ch, ' ', sizeof ch);
+    for (int r = 0; r < ROWS; r++) for (int c = 0; c < COLS; c++) co[r][c] = TFT_WHITE;
+    lcd.setTextSize(1);
+    lcd.setTextWrap(false);
+    lcd.fillScreen(TFT_BLACK);
+  }
+  void color(uint16_t c) { fg = c; }
+  size_t write(uint8_t b) override
+  {
+    in_screen = 1;
+    if (b == '\r') { in_screen = 0; return 1; }
+    if (b == '\n') { newline(); in_screen = 0; return 1; }
+    if (x >= cols) newline();
+    ch[y][x] = b;
+    co[y][x] = fg;
+    drawRun(y, x, x + 1);
+    x++;
+    in_screen = 0;
+    return 1;
+  }
+  /* other code (core 1) only draws if the screen is free within a moment */
+  bool lock(uint32_t ms) { return mutex_enter_timeout_ms(&mx, ms); }
+  void lock() { mutex_enter_blocking(&mx); }
+  void unlock() { mutex_exit(&mx); }
+private:
+  mutex_t mx;
+  char ch[ROWS][COLS];
+  uint16_t co[ROWS][COLS];
+  int cols = COLS, rows = 30, x = 0, y = 0;
+  uint16_t fg = TFT_WHITE;
+  void newline()
+  {
+    x = 0;
+    if (++y < rows) return;
+    y = rows - 1;                           /* shift up one line and redraw */
+    memmove(ch, ch[1], sizeof ch[0] * (rows - 1));
+    memmove(co, co[1], sizeof co[0] * (rows - 1));
+    memset(ch[y], ' ', COLS);
+    for (int r = 0; r < rows; r++) drawRun(r, 0, cols);
+  }
+  void drawRun(int r, int from, int to)
+  {
+    char buf[COLS + 1];
+    while (from < to)
+    {
+      int e = from;
+      uint16_t c = co[r][from];
+      while (e < to && (co[r][e] == c || ch[r][e] == ' ')) { buf[e - from] = ch[r][e]; e++; }
+      buf[e - from] = 0;
+      lcd.setTextColor(c, TFT_BLACK);       /* background colour: fills, no read */
+      lcd.drawString(buf, from * 6, r * 8);
+      from = e;
+    }
+  }
+};
+static Console con;
 
 /* ------------------------------------------------------------ settings */
 
@@ -100,6 +182,13 @@ static void load_settings()
 
 /* ------------------------------------------------------------ keyboard */
 
+static void net_report();
+
+static volatile bool core1_keys = false;   /* set once setup is done: core 1 reads the keys */
+static volatile bool want_report = false;
+static volatile uint32_t loop_tick;
+extern volatile const char *ftp_where;
+
 static bool esc_pressed()
 {
   Wire1.beginTransmission(SB_ADDR);
@@ -107,21 +196,31 @@ static bool esc_pressed()
   if (Wire1.endTransmission() != 0) return false;
   if (Wire1.requestFrom(SB_ADDR, 2) != 2) return false;
   uint8_t state = Wire1.read(), key = Wire1.read();
+  if (state == 1 && (key == 'n' || key == 'N')) want_report = true;
   return state == 1 && key == KEY_ESC;      /* 1 = pressed */
 }
 
 /* back to the PicoCalc Shell: the same request picocalc_shell.h makes
    (UF2 Loader 2.3+, stage3 loads /BOOT2350.UF2) */
-static void return_to_menu()
+static void return_to_menu(bool stuck = false)
 {
-  lcd.println("\nBack to the menu...");
+  watchdog_hw->scratch[7] = stuck ? (FRZ_MAGIC | (in_screen ? 0x100 : 0) | 'E') : 0;
+  if (stuck)                                /* core 0 may be inside the card or the screen */
+  {
+    watchdog_hw->scratch[1] = 1;
+    watchdog_hw->scratch[2] = 0;
+    watchdog_hw->scratch[0] = 0xe98cc638u;
+    watchdog_reboot(0, 0, 0);
+    for (;;) ;
+  }
+  con.println("\nBack to the menu...");
   sd.end();
   delay(200);
   pinMode(SD_DET_PIN, INPUT_PULLUP);
   delayMicroseconds(100);
   if (digitalRead(SD_DET_PIN))              /* no card: the loader couldn't start the shell */
   {
-    lcd.println("No SD card -- switch off instead.");
+    con.println("No SD card -- switch off instead.");
     for (;;) delay(1000);
   }
   watchdog_hw->scratch[1] = 1;              /* boot from the card */
@@ -133,8 +232,8 @@ static void return_to_menu()
 
 static void wait_or_menu(const char *why)
 {
-  lcd.println(why);
-  lcd.println("Press Esc for the menu.");
+  con.println(why);
+  con.println("Press Esc for the menu.");
   for (;;) { if (esc_pressed()) return_to_menu(); delay(50); }
 }
 
@@ -167,7 +266,7 @@ static void set_clock()
   }
   else
   {
-    lcd.print("Clock: asking pool.ntp.org...");
+    con.print("Clock: asking pool.ntp.org...");
     NTP.begin("pool.ntp.org");
     uint32_t until = millis() + 10000;
     while (!clock_is_set() && millis() < until) delay(100);
@@ -178,7 +277,7 @@ static void set_clock()
       struct timespec t2 = { tv.tv_sec, tv.tv_usec * 1000 };
       if (aon_timer_is_running()) aon_timer_set_time(&t2); else aon_timer_start(&t2);
     }
-    lcd.println(clock_is_set() ? " ok" : " no answer");
+    con.println(clock_is_set() ? " ok" : " no answer");
   }
   if (clock_is_set())
   {
@@ -186,11 +285,11 @@ static void set_clock()
     time_t now = time(NULL);
     char buf[40];
     strftime(buf, sizeof buf, "%Y-%m-%d %H:%M", localtime(&now));
-    lcd.print("Time: ");
-    lcd.println(buf);
+    con.print("Time: ");
+    con.println(buf);
   }
   else
-    lcd.println("Files will be undated.");
+    con.println("Files will be undated.");
 }
 
 /* ------------------------------------------------------------ log */
@@ -204,12 +303,56 @@ static void ftp_log(const char *line)
     strftime(t, sizeof t, "%H:%M:%S ", localtime(&now));
   }
   bool result = line[0] == ' ';
-  bool bad = strstr(line, "failed") || strstr(line, "ERROR");
-  lcd.setTextColor(bad ? TFT_RED : result ? TFT_GREEN : TFT_LIGHTGREY);
-  lcd.print(t);
-  lcd.println(line);
-  lcd.setTextColor(TFT_WHITE);
+  bool bad = strstr(line, "failed") || strstr(line, "ERROR") || strstr(line, "lost") ||
+             strstr(line, " 425") || strstr(line, " 426") || strstr(line, " 451") || strstr(line, " 552") || strstr(line, "waited") || strstr(line, "STUCK");
+  con.lock();
+  con.color(bad ? TFT_RED : result ? TFT_GREEN : TFT_LIGHTGREY);
+  con.print(t);
+  con.println(line);
+  con.color(TFT_WHITE);
+  con.unlock();
 }
+
+/* the network library's connection table (it has room for MEMP_NUM_TCP_PCB,
+   5 in this build): local port and state of each.  Shown on a 425, and
+   when N is pressed. */
+static void net_report()
+{
+  static const char *st[] = { "closed", "listen", "syn-sent", "syn-rcvd", "open",
+                              "fin-wait1", "fin-wait2", "close-wait", "closing",
+                              "last-ack", "time-wait" };
+  char l[200];
+  int n = 0, len = 0;
+  {
+    LWIPMutex m;
+    for (int list = 0; list < 2; list++)
+      for (struct tcp_pcb *p = list ? tcp_tw_pcbs : tcp_active_pcbs; p && len < 180; p = p->next)
+      {
+        n++;
+        len += snprintf(l + len, sizeof l - len, "%s%u %s", n > 1 ? ", " : "", p->local_port,
+                        p->state <= TIME_WAIT ? st[p->state] : "?");
+      }
+  }
+  char h[48];
+  snprintf(h, sizeof h, "  Connections in use: %d of %d", n, MEMP_NUM_TCP_PCB);
+  ftp_log(h);
+  if (n)
+  {
+    char *q = l;                            /* wrap at about 50 characters */
+    while (*q)
+    {
+      char line[56] = "    ";
+      int k = strlen(q) > 50 ? 50 : strlen(q);
+      if (k == 50) { while (k > 10 && q[k] != ' ') k--; }
+      strncat(line, q, k);
+      ftp_log(line);
+      q += k;
+      while (*q == ' ') q++;
+    }
+  }
+}
+
+void ftp_net_report() { net_report(); }
 
 /* ------------------------------------------------------------ main */
 
@@ -223,12 +366,24 @@ void setup()
 
   lcd.init();
   lcd.setRotation(4);
-  lcd.fillScreen(TFT_BLACK);
-  lcd.setTextScroll(true);
-  lcd.setScrollRect(0, 0, lcd.width(), lcd.height());
-  lcd.setTextColor(TFT_GREEN);
-  lcd.println("PicoCalc FTP server   (Esc: menu)");
-  lcd.setTextColor(TFT_WHITE);
+  con.begin();
+  con.color(TFT_GREEN);
+  con.println("PicoCalc FTP server   (Esc: menu)");
+  con.color(TFT_WHITE);
+  if ((watchdog_hw->scratch[7] & 0xFFFF0000u) == FRZ_MAGIC)
+  {
+    uint32_t w = watchdog_hw->scratch[6], n = watchdog_hw->scratch[7];
+    const char *where = (w >= 0x10000000 && w < 0x11000000) ? (const char *)w : "?";
+    char c1 = n & 0xFF;
+    char l[96];
+    snprintf(l, sizeof l, "Last run FROZE: core 0 in %s%s, core 1 %s",
+             where, (n & 0x100) ? " (drawing)" : "",
+             c1 == 'K' ? "reading keys" : c1 == 'D' ? "waiting" : c1 == 'E' ? "sent Esc" : "watching");
+    con.color(TFT_RED);
+    con.println(l);
+    con.color(TFT_WHITE);
+  }
+  watchdog_hw->scratch[7] = 0;
 
   if (!sd.begin(SS_PIN, SD_SCK_MHZ(20)))
     wait_or_menu("SD card error.");
@@ -237,24 +392,24 @@ void setup()
   if (!ssid[0])
     wait_or_menu("No WiFi settings: put ssid= and password=\n"
                  "in /config_ftp.conf (or settime.cfg).");
-  lcd.print("Settings: ");
-  lcd.println(cfg_used);
+  con.print("Settings: ");
+  con.println(cfg_used);
 
-  lcd.print("WiFi: joining ");
-  lcd.println(ssid);
+  con.print("WiFi: joining ");
+  con.println(ssid);
   WiFi.begin(ssid, password);
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED)
   {
     for (int i = 0; i < 10; i++) { if (esc_pressed()) return_to_menu(); delay(50); }
-    lcd.print(".");
+    con.print(".");
     if (++tries % 20 == 0)
     {
-      lcd.println(" retrying");
+      con.println(" retrying");
       WiFi.begin(ssid, password);
     }
   }
-  lcd.println();
+  con.println();
   WiFi.noLowPowerMode();                    /* power saving delays packets enough to time out transfers */
 
   set_clock();
@@ -263,31 +418,127 @@ void setup()
   ftpSrv.setLogCallback(ftp_log);
   ftpSrv.begin(ftp_user, ftp_password);
 
-  lcd.println();
-  lcd.setTextColor(TFT_YELLOW);
-  lcd.print("ftp://");
-  lcd.println(WiFi.localIP());
-  lcd.setTextColor(TFT_WHITE);
-  lcd.print("User: ");
-  lcd.print(ftp_user);
-  lcd.print("   Password: ");
-  lcd.println(ftp_password);
-  lcd.println("One connection at a time (set your");
-  lcd.println("client's connection limit to 1).");
-  lcd.println();
-  lcd.println("Esc: back to the menu (wait for");
-  lcd.println("transfers to finish first).");
-  lcd.println();
-  lcd.println("Commands from your client appear below.");
+  con.println();
+  con.color(TFT_YELLOW);
+  con.print("ftp://");
+  con.println(WiFi.localIP());
+  con.color(TFT_WHITE);
+  con.print("User: ");
+  con.print(ftp_user);
+  con.print("   Password: ");
+  con.println(ftp_password);
+  con.println("One connection at a time (set your");
+  con.println("client's connection limit to 1).");
+  con.println();
+  con.println("Esc: back to the menu (wait for");
+  con.println("transfers to finish first).");
+  con.println();
+  {
+    char l[48];
+    snprintf(l, sizeof l, "WiFi signal %ld dBm", (long)WiFi.RSSI());
+    con.println(l);
+  }
+  con.println("N: show network connections.");
+  loop_tick = millis();
+  watchdog_enable(8000, true);              /* reboots if both cores stop */
+  core1_keys = true;
+  con.println("Commands from your client appear below.");
 }
+
+/* the WiFi can drop on its own; nothing would notice, and every
+   transfer would then fail with 425 until a restart.  Say so on the
+   screen and rejoin. */
+static void watch_wifi()
+{
+  static bool up = true;
+  static uint32_t lost_at, retry_at;
+  bool now_up = WiFi.status() == WL_CONNECTED;
+  char l[64];
+  if (up && !now_up)
+  {
+    lost_at = millis();
+    retry_at = millis() + 3000;
+    snprintf(l, sizeof l, "WiFi lost (status %d) -- rejoining", (int)WiFi.status());
+    ftp_log(l);
+  }
+  else if (!up && now_up)
+  {
+    snprintf(l, sizeof l, "  WiFi back after %lu s, signal %ld dBm",
+             (unsigned long)((millis() - lost_at) / 1000), (long)WiFi.RSSI());
+    ftp_log(l);
+    WiFi.noLowPowerMode();
+  }
+  else if (!now_up && (int32_t)(millis() - retry_at) >= 0)
+  {
+    retry_at = millis() + 15000;
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+  }
+  up = now_up;
+}
+
+static volatile bool want_menu = false, want_again = false;
 
 void loop()
 {
+  loop_tick = millis();
+  ftp_where = "loop";
+  if (want_menu) return_to_menu();
+  if (want_report) { want_report = false; net_report(); }
+  if (want_again) { want_again = false; ftp_log("  running again"); }
   ftpSrv.handleFTP();
-  static uint32_t next;
-  if ((int32_t)(millis() - next) >= 0)
+  ftp_where = "loop";
+  static uint32_t next_wifi;
+  if ((int32_t)(millis() - next_wifi) >= 0)
   {
-    next = millis() + 50;
-    if (esc_pressed()) return_to_menu();
+    next_wifi = millis() + 500;
+    ftp_where = "WiFi check";
+    watch_wifi();
+    ftp_where = "loop";
   }
+}
+
+/* core 1: reads the keys, and watches core 0.  If the server's loop stops
+   for 15 s (the longest wait in it is 10 s), say where it was, and let Esc
+   work anyway. */
+void loop1()
+{
+  static bool stuck = false;
+  if (!core1_keys) { delay(50); return; }
+  core1_at = 'D';
+  core1_at = 'K';                           /* reading the keyboard */
+  bool esc = esc_pressed();
+  core1_at = 'W';                           /* watching */
+  /* the freeze note: kept in watchdog scratch 4-7, which a watchdog reboot
+     leaves alone; the next start prints it */
+  /* (scratch 4 is the SDK's; the boot ROM acts on 4-7 only with its own
+     value in 4) */
+  watchdog_hw->scratch[6] = (uint32_t)(const char *)ftp_where;
+  watchdog_hw->scratch[7] = FRZ_MAGIC | (in_screen ? 0x100 : 0) | (uint8_t)core1_at;
+  if (millis() - loop_tick < 15000)         /* core 0 still going: keep the chip alive */
+    watchdog_update();
+  uint32_t idle = millis() - loop_tick;
+  if (esc)
+  {
+    if (idle > 1000) return_to_menu(true);
+    want_menu = true;
+  }
+  if (!stuck && idle > 15000)
+  {
+    stuck = true;
+    char l[64];
+    snprintf(l, sizeof l, "STUCK %lu s in %s (Esc: menu)", (unsigned long)(idle / 1000), (const char *)ftp_where);
+    if (con.lock(500))                      /* if the screen itself is stuck, all we can do is Esc */
+    {
+      con.unlock();
+      ftp_log(l);
+      net_report();
+    }
+  }
+  else if (stuck && idle < 1000)
+  {
+    stuck = false;
+    want_again = true;                      /* core 0 prints it: it owns the screen again */
+  }
+  delay(50);
 }

@@ -29,9 +29,17 @@ partial one is deleted. (APPE, append, adds to the file in place.)
 
 The screen lists each command your client sends, with the time,
 and the result of each upload in green ("saved") or red ("upload
-failed; kept ..."). Handy when a client misbehaves.
+failed; kept ..."). Handy when a client misbehaves. Failures say
+why (425 no data connection, 426 aborted, 451, 552 card full).
+N lists the network connections in use (there is room for 5).
+
+If the WiFi drops, the screen says so and it rejoins by itself.
+If the server ever freezes, it restarts after about 20 seconds;
+the next time you start it, a red "Last run FROZE" line says
+where it was. Please report that line.
 
 Uploaded files get real dates when the clock is set (kept from
 settime or VirtualT, or from pool.ntp.org).
 
-Esc returns to the menu. Let transfers finish first.
+Esc returns to the menu, even if the server is stuck. Let
+transfers finish first.
