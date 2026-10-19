@@ -259,7 +259,7 @@ void setup()
 
   set_clock();
 
-  ftpSrv = FtpServer(21, 21000);
+  ftpSrv = FtpServer(21, 50009);              /* passive data port: one, fixed */
   ftpSrv.setLogCallback(ftp_log);
   ftpSrv.begin(ftp_user, ftp_password);
 

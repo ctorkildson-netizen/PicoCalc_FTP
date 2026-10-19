@@ -651,14 +651,29 @@ bool FtpServer::processCommand()
   //
   else if (CommandIs("PASV"))
   {
-    // Stop existing connections and server
     data.stop();
+#if defined(ARDUINO_ARCH_RP2040)
+    // Keep one data listener on the fixed passive port for the whole
+    // session. Closing it and opening a new one on a random port at every
+    // PASV leaked a connection slot each time the client connected but
+    // the transfer never claimed it, until lwIP had none left: begin()
+    // then failed silently and every transfer got "425 No data
+    // connection". Here stale connections are dropped instead, and the
+    // listener reopened only if it isn't running.
+    while (dataServer.hasClient())
+    {
+      FTP_CLIENT_NETWORK_CLASS stale = dataServer.accept();
+      stale.stop();
+    }
+    if (!dataServer)
+      dataServer.begin(pasvPort);
+    dataPort = pasvPort;
+#else
     dataServer.end();
-    
     // Generate random port in passive mode range (50000-65535)
     dataPort = random(50000, 65535);
     dataServer.begin(dataPort);
-    
+#endif
     // Use configured local IP
     dataIp = localIp;
     
@@ -667,9 +682,15 @@ bool FtpServer::processCommand()
     Serial.print(" and port ");
     Serial.println(dataPort);
     
-    // Allow time for server to initialize
-    delay(50);
-    
+#if defined(ARDUINO_ARCH_RP2040)
+    if (!dataServer)
+    {
+      client.println(F("425 Can't open a data port"));
+      logLine("  425: no free network connection for the data port");
+    }
+    else
+#endif
+    {
     // Send the response to the client
     // Format PASV response with actual IP and port
     char buffer[64];
@@ -683,6 +704,7 @@ bool FtpServer::processCommand()
     Serial.println(buffer);
     
     dataConn = FTP_Pasive;
+    }
   }
   //
   //  PORT - Data Port
