@@ -50,8 +50,14 @@
 
 #include <FtpServer.h>
 
+extern volatile const char *ftp_where;
+#define WHERE(s) (ftp_where = (s))
+
 static void utc_to_local(uint16_t *year, uint8_t *month, uint8_t *day,
                          uint8_t *hour, uint8_t *minute, uint8_t *second);
+
+// where the server last was, for the PicoCalc's hang watcher (main.cpp)
+volatile const char *ftp_where = "start";
 
 FtpServer::FtpServer(uint16_t _cmdPort, uint16_t _pasvPort)
     : ftpServer(_cmdPort), dataServer(_pasvPort)
@@ -206,6 +212,7 @@ void FtpServer::credentials(const char *_user, const char *_pass)
 
 void FtpServer::iniVariables()
 {
+  WHERE("iniVariables");
   // Default for data port
   dataPort = FTP_DATA_PORT_DFLT;
 
@@ -224,6 +231,7 @@ void FtpServer::iniVariables()
 
 uint8_t FtpServer::handleFTP()
 {
+  WHERE("handleFTP");
 #ifdef FTP_ADDITIONAL_DEBUG
   //    int8_t data0 = data.status();
   ftpTransfer transferStage0 = transferStage;
@@ -297,7 +305,7 @@ uint8_t FtpServer::handleFTP()
         cmdStage = FTP_User;
       }
     }
-    else if (readChar() > 0) // got response
+    else if ((WHERE("readChar"), readChar()) > 0) // got response
     {
       processCommand();
       if (cmdStage == FTP_Stop)
@@ -382,6 +390,7 @@ uint8_t FtpServer::handleFTP()
 
 void FtpServer::clientConnected()
 {
+  WHERE("clientConnected");
   DEBUG_PRINTLN(F(" Client connected!"));
   client.print(F("220--- "));
   client.print(welcomeMessage);
@@ -399,6 +408,7 @@ void FtpServer::clientConnected()
 
 void FtpServer::disconnectClient()
 {
+  WHERE("disconnectClient");
   DEBUG_PRINTLN(F(" Disconnecting client"));
 
   abortTransfer();
@@ -420,6 +430,7 @@ void FtpServer::disconnectClient()
 
 bool FtpServer::processCommand()
 {
+  WHERE("processCommand");
   ///////////////////////////////////////
   //                                   //
   //      AUTHENTICATION COMMANDS      //
@@ -1362,6 +1373,9 @@ bool FtpServer::processCommand()
 
 int FtpServer::dataConnect(bool out150)
 {
+  WHERE("dataConnect");
+  uint32_t waitStart = millis();
+  bool gotData = false;
   if (!data.connected())
   {
     if (dataConn == FTP_Pasive)
@@ -1391,16 +1405,18 @@ int FtpServer::dataConnect(bool out150)
           data = dataServer.available();
         }
 #elif defined(ARDUINO_ARCH_RP2040)
-        // For Raspberry Pi Pico W, use available() and check more frequently
-        data = dataServer.available();
-        if (data) {
-          DEBUG_PRINTLN(F("Passive connection established via available()"));
-        }
-        // Print debug info every 500ms
-        if (count % 500 == 0) {
-          DEBUG_PRINT(F("Still waiting for passive connection... "));
-          DEBUG_PRINT(count);
-          DEBUG_PRINTLN(F(" attempts left"));
+        // Keep the first connection that arrives.  FileZilla sends a small
+        // upload and closes before we get here; arduino-pico's connected()
+        // then says false although the whole file is still waiting to be
+        // read, so the old loop replaced it with an empty client on the next
+        // pass and the upload was lost (425).
+        // (An empty upload may even be closed with nothing to read, so any
+        // arrival counts.)
+        if (dataServer.hasClient())
+        {
+          data = dataServer.accept();
+          gotData = true;
+          break;
         }
 #else
         data = dataServer.accept();
@@ -1417,13 +1433,24 @@ int FtpServer::dataConnect(bool out150)
   }
 
   // Check if we have a connection
-  bool connected = data.connected() || data.available();
+  bool connected = gotData || data.connected() || data.available();
   
   if (!connected)
   {
     DEBUG_PRINTLN(F("425 No data connection - connection failed"));
     client.println(F("425 No data connection"));
     logLine("  425: the client's data connection never arrived");
+#if defined(ARDUINO_ARCH_RP2040)
+    if (dataConn == FTP_Pasive)
+    {
+      char why[64];
+      snprintf(why, sizeof why, "  (port %u %s, waited %lu ms)", (unsigned)dataPort,
+               dataServer ? "listening" : "NOT listening", (unsigned long)(millis() - waitStart));
+      logLine(why);
+      extern void ftp_net_report() __attribute__((weak));
+      if (ftp_net_report) ftp_net_report();
+    }
+#endif
   }
   else if (out150)
   {
@@ -1437,6 +1464,7 @@ int FtpServer::dataConnect(bool out150)
 
 bool FtpServer::dataConnected()
 {
+  WHERE("dataConnected");
   if (data.connected())
     return true;
   data.stop();
@@ -1447,6 +1475,7 @@ bool FtpServer::dataConnected()
 
 bool FtpServer::openDir(FTP_DIR *pdir)
 {
+  WHERE("openDir");
   DEBUG_PRINT("OpenDIR cwdName -> ");
   DEBUG_PRINTLN(cwdName);
 
@@ -1562,6 +1591,7 @@ bool FtpServer::openDir(FTP_DIR *pdir)
 
 bool FtpServer::doRetrieve()
 {
+  WHERE("doRetrieve");
   if (!dataConnected())
   {
     file.close();
@@ -1605,6 +1635,7 @@ bool FtpServer::doRetrieve()
 
 bool FtpServer::doStore()
 {
+  WHERE("doStore");
   int16_t na = data.available();
   if (na == 0)
   {
@@ -1768,6 +1799,7 @@ void generateFileLine(FTP_CLIENT_NETWORK_CLASS *data, bool isDirectory, const ch
 
 bool FtpServer::doList()
 {
+  WHERE("doList");
   if (!dataConnected())
   {
 #if STORAGE_TYPE != STORAGE_SPIFFS && STORAGE_TYPE != STORAGE_LITTLEFS && STORAGE_TYPE != STORAGE_SEEED_SD
@@ -1957,6 +1989,7 @@ bool FtpServer::doList()
 
 bool FtpServer::doMlsd()
 {
+  WHERE("doMlsd");
   if (!dataConnected())
   {
 #if STORAGE_TYPE != STORAGE_SPIFFS && STORAGE_TYPE != STORAGE_LITTLEFS && STORAGE_TYPE != STORAGE_SEEED_SD
@@ -2222,6 +2255,7 @@ bool FtpServer::doMlsd()
 
 void FtpServer::closeTransfer()
 {
+  WHERE("closeTransfer");
   uint32_t deltaT = (int32_t)(millis() - millisBeginTrans);
   file.close();
   if (storeTmp[0] && !finishStore())
@@ -2259,6 +2293,7 @@ void FtpServer::closeTransfer()
 
 void FtpServer::abortTransfer()
 {
+  WHERE("abortTransfer");
   if (transferStage != FTP_Close)
   {
     if (FtpServer::_transferCallback)
@@ -2456,6 +2491,7 @@ int utf8_strlen(const String &str)
 
 bool FtpServer::makePath(char *fullName, char *param)
 {
+  WHERE("makePath");
   if (param == NULL)
     param = parameter;
 
@@ -2576,6 +2612,7 @@ bool FtpServer::makePath(char *fullName, char *param)
 
 bool FtpServer::makeExistsPath(char *path, char *param)
 {
+  WHERE("makeExistsPath");
   DEBUG_PRINT(F(" CWD PATH: cwdName -> "));
   DEBUG_PRINT(cwdName);
   DEBUG_PRINT(F(" - param "));
@@ -2734,6 +2771,7 @@ uint32_t FtpServer::fileSize(FTP_FILE &file)
 #if (STORAGE_TYPE == STORAGE_SEEED_SD)
 bool FtpServer::openFile(char path[FTP_CWD_SIZE], int readTypeInt)
 {
+  WHERE("openFile");
   DEBUG_PRINT(F("File to open "));
   DEBUG_PRINT(path);
   DEBUG_PRINT(F(" readType "));
@@ -2763,6 +2801,7 @@ bool FtpServer::openFile(char path[FTP_CWD_SIZE], int readTypeInt)
 #elif ((STORAGE_TYPE == STORAGE_SD || STORAGE_TYPE == STORAGE_SD_MMC) && defined(ESP8266)) // FTP_SERVER_NETWORK_TYPE_SELECTED == NETWORK_ESP8266_242)
 bool FtpServer::openFile(char path[FTP_CWD_SIZE], int readTypeInt)
 {
+  WHERE("openFile");
   DEBUG_PRINT(F("File to open "));
   DEBUG_PRINT(path);
   DEBUG_PRINT(F(" readType "));
@@ -2792,6 +2831,7 @@ bool FtpServer::openFile(char path[FTP_CWD_SIZE], int readTypeInt)
 #elif (STORAGE_TYPE == STORAGE_SPIFFS || STORAGE_TYPE == STORAGE_LITTLEFS || STORAGE_TYPE == STORAGE_FFAT)
 bool FtpServer::openFile(const char *path, const char *readType)
 {
+  WHERE("openFile");
   DEBUG_PRINT(F("File to open "));
   DEBUG_PRINT(path);
   DEBUG_PRINT(F(" readType "));
@@ -2811,6 +2851,7 @@ bool FtpServer::openFile(const char *path, const char *readType)
 #elif STORAGE_TYPE <= STORAGE_SDFAT2 || STORAGE_TYPE == STORAGE_SPIFM || ((STORAGE_TYPE == STORAGE_SD || STORAGE_TYPE == STORAGE_SD_MMC) && ARDUINO_ARCH_SAMD)
 bool FtpServer::openFile(char path[FTP_CWD_SIZE], int readTypeInt)
 {
+  WHERE("openFile");
   DEBUG_PRINT(F("File to open "));
   DEBUG_PRINT(path);
   DEBUG_PRINT(F(" readType "));
@@ -2832,10 +2873,12 @@ bool FtpServer::openFile(char path[FTP_CWD_SIZE], int readTypeInt)
 #else
 bool FtpServer::openFile(char path[FTP_CWD_SIZE], const char *readType)
 {
+  WHERE("openFile");
   return openFile((const char *)path, readType);
 }
 bool FtpServer::openFile(const char *path, const char *readType)
 {
+  WHERE("openFile");
   DEBUG_PRINT(F("File to open "));
   DEBUG_PRINT(path);
   DEBUG_PRINT(F(" readType "));
@@ -2867,6 +2910,7 @@ bool FtpServer::openFile(const char *path, const char *readType)
 // Return true if path points to a directory
 bool FtpServer::isDir(char *path)
 {
+  WHERE("isDir");
 #if (STORAGE_TYPE == STORAGE_LITTLEFS && (defined(ESP8266) || defined(ARDUINO_ARCH_RP2040)))
   FTP_DIR dir;
   bool res;
@@ -2932,6 +2976,7 @@ bool FtpServer::isDir(char *path)
 bool FtpServer::timeStamp(char *path, uint16_t year, uint8_t month, uint8_t day,
                           uint8_t hour, uint8_t minute, uint8_t second)
 {
+  WHERE("timeStamp");
 #if STORAGE_TYPE == STORAGE_SPIFFS || STORAGE_TYPE == STORAGE_LITTLEFS || STORAGE_TYPE == STORAGE_FFAT || STORAGE_TYPE == STORAGE_SD || STORAGE_TYPE == STORAGE_SD_MMC || STORAGE_TYPE == STORAGE_SEEED_SD
   //	struct tm tmDate = { second, minute, hour, day, month, year };
   //    time_t rawtime = mktime(&tmDate);
@@ -3001,6 +3046,7 @@ bool FtpServer::getFileModTime(uint16_t *pdate, uint16_t *ptime)
 #if (STORAGE_TYPE == STORAGE_SD || STORAGE_TYPE == STORAGE_SD_MMC) && !defined(ESP32)
 bool FtpServer::rename(const char *path, const char *newpath)
 {
+  WHERE("rename");
 
   FTP_FILE myFileIn = STORAGE_MANAGER.open(path, FILE_READ);
   FTP_FILE myFileOut = STORAGE_MANAGER.open(newpath, FILE_WRITE);
@@ -3053,6 +3099,7 @@ void FtpServer::logLine(const char *a, const char *b)
 // the upload completed: put the new file in place of the old one
 bool FtpServer::finishStore()
 {
+  WHERE("finishStore");
   bool ok = true;
   if (exists(storeFinal) && !remove(storeFinal))
     ok = false;
@@ -3066,6 +3113,7 @@ bool FtpServer::finishStore()
 // the upload failed: drop the partial file, keep the old one
 void FtpServer::discardStore()
 {
+  WHERE("discardStore");
   if (!storeTmp[0])
     return;
   remove(storeTmp);
