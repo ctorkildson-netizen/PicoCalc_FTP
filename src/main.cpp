@@ -25,11 +25,9 @@
 #include <SdFat.h>
 #include <sdios.h>
 #include <SimpleFTPServer.h>
-#include "hardware/watchdog.h"
 #include "hardware/structs/watchdog.h"
 #include "pico/aon_timer.h"
 #include <lwip_wrap.h>
-#include "pico/mutex.h"
 #include "hardware/watchdog.h"
 #include "lwip/tcp.h"
 #include "lwip/priv/tcp_priv.h"
@@ -59,9 +57,6 @@ static const char *cfg_used = 0;
    which the PicoCalc's display can't do reliably -- garbled lines), and its
    read loop has no timeout, so a lost byte froze the whole server.  This
    only ever writes to the display. */
-#define FRZ_MAGIC 0x465A0000u                /* "FZ": a freeze note in watchdog scratch 7 */
-static volatile int in_screen;             /* core 0 is drawing (for the freeze note) */
-static volatile char core1_at = '-';       /* what core 1 is doing */
 
 class Console : public Print
 {
@@ -69,7 +64,6 @@ public:
   static const int COLS = 53, ROWS = 40;
   void begin()
   {
-    mutex_init(&mx);
     cols = lcd.width() / 6;  if (cols > COLS) cols = COLS;
     rows = lcd.height() / 8; if (rows > ROWS) rows = ROWS;
     memset(ch, ' ', sizeof ch);
@@ -81,23 +75,16 @@ public:
   void color(uint16_t c) { fg = c; }
   size_t write(uint8_t b) override
   {
-    in_screen = 1;
-    if (b == '\r') { in_screen = 0; return 1; }
-    if (b == '\n') { newline(); in_screen = 0; return 1; }
+    if (b == '\r') return 1;
+    if (b == '\n') { newline(); return 1; }
     if (x >= cols) newline();
     ch[y][x] = b;
     co[y][x] = fg;
     drawRun(y, x, x + 1);
     x++;
-    in_screen = 0;
     return 1;
   }
-  /* other code (core 1) only draws if the screen is free within a moment */
-  bool lock(uint32_t ms) { return mutex_enter_timeout_ms(&mx, ms); }
-  void lock() { mutex_enter_blocking(&mx); }
-  void unlock() { mutex_exit(&mx); }
 private:
-  mutex_t mx;
   char ch[ROWS][COLS];
   uint16_t co[ROWS][COLS];
   int cols = COLS, rows = 30, x = 0, y = 0;
@@ -184,9 +171,7 @@ static void load_settings()
 
 static void net_report();
 
-static volatile bool core1_keys = false;   /* set once setup is done: core 1 reads the keys */
 static volatile bool want_report = false;
-static volatile uint32_t loop_tick;
 extern volatile const char *ftp_where;
 
 static bool esc_pressed()
@@ -202,17 +187,8 @@ static bool esc_pressed()
 
 /* back to the PicoCalc Shell: the same request picocalc_shell.h makes
    (UF2 Loader 2.3+, stage3 loads /BOOT2350.UF2) */
-static void return_to_menu(bool stuck = false)
+static void return_to_menu()
 {
-  watchdog_hw->scratch[7] = stuck ? (FRZ_MAGIC | (in_screen ? 0x100 : 0) | 'E') : 0;
-  if (stuck)                                /* core 0 may be inside the card or the screen */
-  {
-    watchdog_hw->scratch[1] = 1;
-    watchdog_hw->scratch[2] = 0;
-    watchdog_hw->scratch[0] = 0xe98cc638u;
-    watchdog_reboot(0, 0, 0);
-    for (;;) ;
-  }
   con.println("\nBack to the menu...");
   sd.end();
   delay(200);
@@ -304,13 +280,11 @@ static void ftp_log(const char *line)
   }
   bool result = line[0] == ' ';
   bool bad = strstr(line, "failed") || strstr(line, "ERROR") || strstr(line, "lost") ||
-             strstr(line, " 425") || strstr(line, " 426") || strstr(line, " 451") || strstr(line, " 552") || strstr(line, "waited") || strstr(line, "STUCK");
-  con.lock();
+             strstr(line, " 425") || strstr(line, " 426") || strstr(line, " 451") || strstr(line, " 552") || strstr(line, "waited") || strstr(line, "not answering");
   con.color(bad ? TFT_RED : result ? TFT_GREEN : TFT_LIGHTGREY);
   con.print(t);
   con.println(line);
   con.color(TFT_WHITE);
-  con.unlock();
 }
 
 /* the network library's connection table (it has room for MEMP_NUM_TCP_PCB,
@@ -370,20 +344,6 @@ void setup()
   con.color(TFT_GREEN);
   con.println("PicoCalc FTP server   (Esc: menu)");
   con.color(TFT_WHITE);
-  if ((watchdog_hw->scratch[7] & 0xFFFF0000u) == FRZ_MAGIC)
-  {
-    uint32_t w = watchdog_hw->scratch[6], n = watchdog_hw->scratch[7];
-    const char *where = (w >= 0x10000000 && w < 0x11000000) ? (const char *)w : "?";
-    char c1 = n & 0xFF;
-    char l[96];
-    snprintf(l, sizeof l, "Last run FROZE: core 0 in %s%s, core 1 %s",
-             where, (n & 0x100) ? " (drawing)" : "",
-             c1 == 'K' ? "reading keys" : c1 == 'D' ? "waiting" : c1 == 'E' ? "sent Esc" : "watching");
-    con.color(TFT_RED);
-    con.println(l);
-    con.color(TFT_WHITE);
-  }
-  watchdog_hw->scratch[7] = 0;
 
   if (!sd.begin(SS_PIN, SD_SCK_MHZ(20)))
     wait_or_menu("SD card error.");
@@ -439,9 +399,6 @@ void setup()
     con.println(l);
   }
   con.println("N: show network connections.");
-  loop_tick = millis();
-  watchdog_enable(8000, true);              /* reboots if both cores stop */
-  core1_keys = true;
   con.println("Commands from your client appear below.");
 }
 
@@ -477,15 +434,20 @@ static void watch_wifi()
   up = now_up;
 }
 
-static volatile bool want_menu = false, want_again = false;
 
 void loop()
 {
-  loop_tick = millis();
   ftp_where = "loop";
-  if (want_menu) return_to_menu();
+  static uint32_t next_key;
+  if ((int32_t)(millis() - next_key) >= 0)
+  {
+    next_key = millis() + 50;
+    ftp_where = "keyboard";
+    if (esc_pressed()) return_to_menu();
+    ftp_where = "loop";
+  }
   if (want_report) { want_report = false; net_report(); }
-  if (want_again) { want_again = false; ftp_log("  running again"); }
+
   ftpSrv.handleFTP();
   ftp_where = "loop";
   static uint32_t next_wifi;
@@ -496,49 +458,4 @@ void loop()
     watch_wifi();
     ftp_where = "loop";
   }
-}
-
-/* core 1: reads the keys, and watches core 0.  If the server's loop stops
-   for 15 s (the longest wait in it is 10 s), say where it was, and let Esc
-   work anyway. */
-void loop1()
-{
-  static bool stuck = false;
-  if (!core1_keys) { delay(50); return; }
-  core1_at = 'D';
-  core1_at = 'K';                           /* reading the keyboard */
-  bool esc = esc_pressed();
-  core1_at = 'W';                           /* watching */
-  /* the freeze note: kept in watchdog scratch 4-7, which a watchdog reboot
-     leaves alone; the next start prints it */
-  /* (scratch 4 is the SDK's; the boot ROM acts on 4-7 only with its own
-     value in 4) */
-  watchdog_hw->scratch[6] = (uint32_t)(const char *)ftp_where;
-  watchdog_hw->scratch[7] = FRZ_MAGIC | (in_screen ? 0x100 : 0) | (uint8_t)core1_at;
-  if (millis() - loop_tick < 15000)         /* core 0 still going: keep the chip alive */
-    watchdog_update();
-  uint32_t idle = millis() - loop_tick;
-  if (esc)
-  {
-    if (idle > 1000) return_to_menu(true);
-    want_menu = true;
-  }
-  if (!stuck && idle > 15000)
-  {
-    stuck = true;
-    char l[64];
-    snprintf(l, sizeof l, "STUCK %lu s in %s (Esc: menu)", (unsigned long)(idle / 1000), (const char *)ftp_where);
-    if (con.lock(500))                      /* if the screen itself is stuck, all we can do is Esc */
-    {
-      con.unlock();
-      ftp_log(l);
-      net_report();
-    }
-  }
-  else if (stuck && idle < 1000)
-  {
-    stuck = false;
-    want_again = true;                      /* core 0 prints it: it owns the screen again */
-  }
-  delay(50);
 }
