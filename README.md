@@ -125,6 +125,14 @@ The `.uf2` built from `raspberypi_pico2w` can be copied to the SD card's
   zone string, default `PST8PDT,M3.2.0,M11.1.0`.
 - The server takes one connection at a time: in FileZilla, limit
   simultaneous connections to 1.
+- Passive mode always uses data port 50009, so that is the one to allow
+  through a firewall.
+- Uploads are safe: a file arrives as `NAME.~up` and replaces `NAME`
+  only once all of it is there. A failed or cancelled upload leaves the
+  old file as it was and deletes the partial one.
+- The screen logs each command with the time, and each upload as saved
+  or failed, with the reason (425, 426, 451, 552 card full). **N** lists
+  the network connections in use. If the WiFi drops, it rejoins by itself.
 
 ## Author
 
