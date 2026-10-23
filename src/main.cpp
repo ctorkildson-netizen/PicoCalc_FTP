@@ -338,9 +338,14 @@ void setup()
   Wire1.setClock(10000);
   while (esc_pressed()) ;                   /* drain keys left from the menu */
 
+  /* The display comes up switched off (see LGFX_config.hpp): clear it, then
+     turn it on, so it never flashes white */
   lcd.init();
   lcd.setRotation(4);
   con.begin();
+  lcd.startWrite();
+  lcd.writeCommand(0x29);                   /* DISPON */
+  lcd.endWrite();
   con.color(TFT_GREEN);
   con.println("PicoCalc FTP server   (Esc: menu)");
   con.color(TFT_WHITE);
