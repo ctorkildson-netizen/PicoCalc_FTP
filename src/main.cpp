@@ -190,6 +190,8 @@ static bool esc_pressed()
 static void return_to_menu()
 {
   con.println("\nBack to the menu...");
+  WiFi.disconnect();                        /* tell the router we've gone, so the next program joins at once */
+  delay(200);
   sd.end();
   delay(200);
   pinMode(SD_DET_PIN, INPUT_PULLUP);
@@ -362,16 +364,23 @@ void setup()
 
   con.print("WiFi: joining ");
   con.println(ssid);
-  WiFi.begin(ssid, password);
-  int tries = 0;
+  /* Start joining and watch, rather than WiFi.begin(), which waits up to
+     30 s for a connection even after the router has said no. A program
+     before this one that used Wi-Fi and ended by a reset leaves the router
+     holding its connection for a minute or so, and the router turns the
+     first try away; asking again at once gets in. */
+  WiFi.beginNoBlock(ssid, password);
+  int tries = 0, asked = 0;
   while (WiFi.status() != WL_CONNECTED)
   {
     for (int i = 0; i < 10; i++) { if (esc_pressed()) return_to_menu(); delay(50); }
     con.print(".");
-    if (++tries % 20 == 0)
+    ++tries;
+    bool refused = WiFi.status() == WL_CONNECT_FAILED;
+    if ((refused && tries - asked >= 2) || tries - asked >= 30)
     {
-      con.println(" retrying");
-      WiFi.begin(ssid, password);
+      WiFi.beginNoBlock(ssid, password);
+      asked = tries;
     }
   }
   con.println();
@@ -434,7 +443,7 @@ static void watch_wifi()
   {
     retry_at = millis() + 15000;
     WiFi.disconnect();
-    WiFi.begin(ssid, password);
+    WiFi.beginNoBlock(ssid, password);      /* (begin() would sit up to 30 s, Esc and all) */
   }
   up = now_up;
 }
